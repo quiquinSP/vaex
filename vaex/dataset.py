@@ -101,7 +101,8 @@ def _parse_reduction(name, colormap, colors):
 		import matplotlib
 		cmap = matplotlib.cm.get_cmap(colormap)
 		def f(grid):
-			return cmap(grid)
+			masked_grid = np.ma.masked_invalid(grid) # convert inf/nan to a mask so that mpl colors bad values correcty
+			return cmap(masked_grid)
 		return f
 	elif name.startswith("stack.color"):
 		def f(grid, colors=colors, colormap=colormap):
@@ -408,7 +409,7 @@ class UnitScope(object):
 			raise KeyError("unkown variable %s" % variable)
 
 class _BlockScope(object):
-	def __init__(self, dataset, i1, i2, **variables):
+	def __init__(self, dataset, i1, i2, mask=None, **variables):
 		"""
 
 		:param DatasetLocal dataset: the *local*  dataset
@@ -423,6 +424,7 @@ class _BlockScope(object):
 		self.variables = variables
 		self.values = dict(self.variables)
 		self.buffers = {}
+		self.mask = mask if mask is not None else slice(None, None, None)
 
 	def move(self, i1, i2):
 		length_new = i2 - i1
@@ -465,15 +467,15 @@ class _BlockScope(object):
 		if variable in expression_namespace:
 			return expression_namespace[variable]
 		try:
-			if variable in self.dataset.get_column_names(strings=True):
+			if variable in self.values:
+				return self.values[variable]
+			elif variable in self.dataset.get_column_names(strings=True):
 				if self.dataset._needs_copy(variable):
 					#self._ensure_buffer(variable)
 					#self.values[variable] = self.buffers[variable] = self.dataset.columns[variable][self.i1:self.i2].astype(np.float64)
-					self.values[variable] = self.dataset.columns[variable][self.i1:self.i2].astype(np.float64)
+					self.values[variable] = self.dataset.columns[variable][self.i1:self.i2][self.mask].astype(np.float64)
 				else:
-					self.values[variable] = self.dataset.columns[variable][self.i1:self.i2]
-			elif variable in self.values:
-				return self.values[variable]
+					self.values[variable] = self.dataset.columns[variable][self.i1:self.i2][self.mask]
 			elif variable in list(self.dataset.virtual_columns.keys()):
 				expression = self.dataset.virtual_columns[variable]
 				#self._ensure_buffer(variable)
@@ -503,48 +505,32 @@ class _BlockScopeSelection(object):
 			import traceback as tb
 			tb.print_stack()
 			raise
-		#if selection is None:
-		selection = self.get_selection(name)
-		#if selection is None:
-		#	return None
-		cache = self._selection_mask_caches.get(expression)
-		if cache:
-			key = (i1, i2)
-			value = cache.get(key)
-			logger.debug("cache for %r is %r", name, value)
-			if value is None or value[0] != selection:
-				logger.debug("creating new mask")
-				mask = selection.evaluate(name, i1, i2)
-				cache[key] = selection, mask
-			else:
-				selection_in_cache, mask = value
-		return mask
-		result = eval(expression, expression_namespace, self)
-		return result
 
 	def __getitem__(self, variable):
-		logger.debug("getitem for selection: %s", variable)
+		#logger.debug("getitem for selection: %s", variable)
 		try:
 			selection = self.selection or self.dataset.get_selection(variable)
-			logger.debug("selection: %s %r", selection, self.dataset.selection_histories)
+			#logger.debug("selection for %r: %s %r", variable, selection, self.dataset.selection_histories)
 			key = (self.i1, self.i2)
 			if selection:
-				cache = self.dataset._selection_mask_caches.get(variable)
-				if cache:
-					selection_in_cache, mask = cache.get(key, (None, None))
-					logger.debug("mask for %r is %r", variable, mask)
-					if selection_in_cache == selection:
-						return mask
-				logger.debug("was not cached")
+				cache = self.dataset._selection_mask_caches[variable]
+				#logger.debug("selection cache: %r" % cache)
+				selection_in_cache, mask = cache.get(key, (None, None))
+				#logger.debug("mask for %r is %r", variable, mask)
+				if selection_in_cache == selection:
+					return mask
+				#logger.debug("was not cached")
 				mask = selection.evaluate(variable, self.i1, self.i2)
-				if cache:
-					cache[key] = selection, mask
+				#logger.debug("put selection in mask with key %r" % (key,))
+				cache[key] = selection, mask
 				return mask
 			else:
 					if variable in expression_namespace:
 						return expression_namespace[variable]
 					elif variable in self.dataset.get_column_names(strings=True):
 						return self.dataset.columns[variable][self.i1:self.i2]
+					elif variable in self.dataset.variables:
+						return self.dataset.variables[variable]
 					elif variable in list(self.dataset.virtual_columns.keys()):
 						expression = self.dataset.virtual_columns[variable]
 						#self._ensure_buffer(variable)
@@ -594,7 +580,7 @@ class SelectionExpression(Selection):
 			previous_mask = self.dataset.evaluate_selection_mask(name, i1, i2, selection=self.previous_selection)
 		else:
 			previous_mask = None
-		current_mask = self.dataset.evaluate(self.boolean_expression, i1, i2).astype(np.bool)
+		current_mask = self.dataset.evaluate_selection_mask(self.boolean_expression, i1, i2).astype(np.bool)
 		if previous_mask is None:
 			logger.debug("setting mask")
 			mask = current_mask
@@ -604,30 +590,6 @@ class SelectionExpression(Selection):
 			mask = mode_function(previous_mask, current_mask)
 		return mask
 
-
-	def execute(self, executor, execute_fully=False):
-		super(SelectionExpression, self).execute(executor=executor, execute_fully=execute_fully)
-		mode_function = _select_functions[self.mode]
-		if self.boolean_expression is None:
-			self.dataset._set_mask(None)
-			promise = vaex.promise.Promise()
-			promise.fulfill(None)
-			return promise
-		else:
-			logger.debug("executing selection: %r, mode: %r", self.boolean_expression, self.mode)
-			mask = np.zeros(len(self.dataset), dtype=np.bool)
-			def map(thread_index, i1, i2, block):
-				mask[i1:i2] = mode_function(None if self.dataset.mask is None else self.dataset.mask[i1:i2], block == 1)
-				return 0
-			def reduce(*args):
-				None
-			expr = self.dataset(self.boolean_expression, executor=executor)
-			task = TaskMapReduce(self.dataset, [self.boolean_expression], lambda thread_index, i1, i2, *blocks: [map(thread_index, i1, i2, block) for block in blocks], reduce, info=True)
-			def apply_mask(*args):
-				#print "Setting mask"
-				self.dataset._set_mask(mask)
-			task.then(apply_mask)
-			return expr._task(task)
 
 class SelectionInvert(Selection):
 	def __init__(self, dataset, previous_selection):
@@ -642,33 +604,6 @@ class SelectionInvert(Selection):
 	def evaluate(self, name, i1, i2):
 		previous_mask = self.dataset.evaluate_selection_mask(name, i1, i2, selection=self.previous_selection)
 		return ~previous_mask
-
-
-	def execute(self, executor, execute_fully=False):
-		super(SelectionInvert, self).execute(executor=executor, execute_fully=execute_fully)
-		self.dataset.mask = ~self.dataset.mask
-		self.dataset._set_mask(self.dataset.mask)
-		return
-		if self.boolean_expression is None:
-			self.dataset._set_mask(None)
-			promise = vaex.promise.Promise()
-			promise.fulfill(None)
-			return promise
-		else:
-			logger.debug("executing selection: %r, mode: %r", self.boolean_expression, self.mode)
-			mask = np.zeros(len(self.dataset), dtype=np.bool)
-			def map(thread_index, i1, i2, block):
-				mask[i1:i2] = mode_function(None if self.dataset.mask is None else self.dataset.mask[i1:i2], block == 1)
-				return 0
-			def reduce(*args):
-				None
-			expr = self.dataset(self.boolean_expression, executor=executor)
-			task = TaskMapReduce(self.dataset, [self.boolean_expression], lambda thread_index, i1, i2, *blocks: [map(thread_index, i1, i2, block) for block in blocks], reduce, info=True)
-			def apply_mask(*args):
-				#print "Setting mask"
-				self.dataset._set_mask(mask)
-			task.then(apply_mask)
-			return expr._task(task)
 
 class SelectionLasso(Selection):
 	def __init__(self, dataset, boolean_expression_x, boolean_expression_y, xseq, yseq, previous_selection, mode):
@@ -700,28 +635,6 @@ class SelectionLasso(Selection):
 			mask = mode_function(previous_mask, current_mask)
 		return mask
 
-	def execute(self, executor, execute_fully=False):
-		super(SelectionLasso, self).execute(executor=executor, execute_fully=execute_fully)
-		mode_function = _select_functions[self.mode]
-		x, y = np.array(self.xseq, dtype=np.float64), np.array(self.yseq, dtype=np.float64)
-		meanx = x.mean()
-		meany = y.mean()
-		radius = np.sqrt((meanx-x)**2 + (meany-y)**2).max()
-
-		mask = np.zeros(len(self.dataset), dtype=np.bool)
-		def lasso(thread_index, i1, i2, blockx, blocky):
-			vaex.vaexfast.pnpoly(x, y, blockx, blocky, mask[i1:i2], meanx, meany, radius)
-			mask[i1:i2] = mode_function(None if self.dataset.mask is None else self.dataset.mask[i1:i2], mask[i1:i2])
-			return 0
-		def reduce(*args):
-			None
-		subspace = self.dataset(self.boolean_expression_x, self.boolean_expression_y, executor=executor)
-		task = TaskMapReduce(self.dataset, subspace.expressions, lambda thread_index, i1, i2, blockx, blocky: lasso(thread_index, i1, i2, blockx, blocky), reduce, info=True)
-		def apply_mask(*args):
-			#print "Setting mask"
-			self.dataset._set_mask(mask)
-		task.then(apply_mask)
-		return subspace._task(task)
 
 	def to_dict(self):
 		previous = None
@@ -995,20 +908,6 @@ class Dataset(object):
 				return np.array(vaex.utils.unlistify(waslist, mi_list))
 		values = finish(delayed_list(has_limits(limits, mi_limits)))
 		return self._async(async, values)
-
-		if limits is None:
-			limits_done = Task.fulfilled(self.minmax())
-		else:
-			limits_done = Task.fulfilled(limits)
-		if grid is None:
-			if limits is None:
-				histogram_done = limits_done.then(lambda limits: self.histogram(limits, size=size))
-			else:
-				histogram_done = Task.fulfilled(self.histogram(limits, size=size))
-		else:
-			histogram_done = Task.fulfilled(grid)
-		mutual_information_promise = histogram_done.then(vaex.kld.mutual_information)
-		return mutual_information_promise if self.async else mutual_information_promise.get()
 
 	@docsubst
 	def count(self, expression=None, binby=[], limits=None, shape=default_shape, selection=False, async=False, progress=None):
@@ -1903,36 +1802,6 @@ class Dataset(object):
 			return vaex.utils.unlistify(waslist, limits_outer)
 		return self._async(async, finish(limits_list))
 
-	def __minmax__old(self, expression, progressbar=False, selection=None):
-		waslist, expressions = vaex.utils.listify(expression)
-		subspace = self(*expressions)
-		if selection:
-			subspace = subspace.selected()
-		return vaex.utils.unlistify(waslist, subspace.minmax())
-
-	def histogram(self, expressions, limits, shape=256, weight=None, progressbar=False, selection=None):
-		subspace = self(*expressions)
-		if selection:
-			subspace = subspace.selected()
-		return subspace.histogram(limits=limits, size=shape, weight=weight)#, progressbar=progressbar)
-
-	def __mean_old(self, expression, binby=[], limits=None, shape=256, progressbar=False, selection=None):
-		if len(binby) == 0:
-			subspace = self(expression)
-			if selection:
-				subspace = subspace.selected()
-			return subspace.mean()[0]
-		else:
-			# todo, fix progressbar into two...
-			limits = self.limits(binby, limits)
-			subspace = self(*binby)
-			if selection:
-				subspace = subspace.selected()
-			counts = self.count(expression, binby=binby, limits=limits, shape=shape, progressbar=progressbar, selection=selection)
-			summed = self.sum  (expression, binby=binby, limits=limits, shape=shape, progressbar=progressbar, selection=selection)
-			mean = summed/counts
-			mean[counts==0] = np.nan
-			return mean
 
 	def mode(self, expression, binby=[], limits=None, shape=256, mode_shape=64, mode_limits=None, progressbar=False, selection=None):
 		if len(binby) == 0:
@@ -1964,35 +1833,6 @@ class Dataset(object):
 			modes[~ok] = np.nan
 			return modes
 
-	def __sum_old(self, expression, binby=[], limits=None, shape=256, progressbar=False, selection=None):
-		if len(binby) == 0:
-			subspace = self(expression)
-			if selection:
-				subspace = subspace.selected()
-			return subspace.sum()[0]
-		else:
-			# todo, fix progressbar into two...
-			subspace = self(*binby)
-			if selection:
-				subspace = subspace.selected()
-			summed = subspace.histogram(limits=limits, size=shape, progressbar=progressbar,
-									weight=expression)
-			return summed
-
-	def __count_old(self, expression=None, binby=[], limits=None, shape=256, progressbar=False, selection=None):
-		if len(binby) == 0:
-			subspace = self("(%s)*0+1" % expression)
-			if selection:
-				subspace = subspace.selected()
-			return subspace.sum()[0]
-		else:
-			limits = self.limits(list(binby), limits)
-			subspace = self(*binby)
-			if selection:
-				subspace = subspace.selected()
-			summed = subspace.histogram(limits=limits, size=shape, progressbar=progressbar,
-									weight=("(%s)*0+1" % expression) if expression is not None else None)
-			return summed
 
 	def plot_bq(self, x, y, grid=None, size=256, limits=None, square=False, center=None, weight=None, figsize=None,
 			 aspect="auto", f="identity", fig=None, axes=None, xlabel=None, ylabel=None, title=None,
@@ -2228,9 +2068,9 @@ class Dataset(object):
 
 	#def plot(self, x=None, y=None, z=None, axes=[], row=None, agg=None, extra=["selection:none,default"], reduce=["colormap", "stack.fade"], f="log", n="normalize", naxis=None,
 	def plot(self, x=None, y=None, z=None, what="count(*)", vwhat=None, reduce=["colormap"], f=None,
-			 normalize="normalize", normalize_axis="what",
-			 vmin=None, vmax=None,
-			 shape=256, vshape=32, limits=None, grid=None, colormap="afmhot", # colors=["red", "green", "blue"],
+			normalize="normalize", normalize_axis="what",
+			vmin=None, vmax=None,
+		 	shape=256, vshape=32, limits=None, grid=None, colormap="afmhot", # colors=["red", "green", "blue"],
 			figsize=None, xlabel=None, ylabel=None, aspect="auto", tight_layout=True, interpolation="nearest", show=False,
 			colorbar=True,
 			selection=None, selection_labels=None, title=None,
@@ -2475,7 +2315,8 @@ class Dataset(object):
 					total_grid[i,j,:,:] = grid[:,None,...]
 			labels["what"] = what_labels
 		else:
-			total_grid = np.broadcast_to(grid, (1,) * 4 + grid.shape)
+			dims_left = 6-len(grid.shape)
+			total_grid = np.broadcast_to(grid, (1,) * dims_left + grid.shape)
 
 		#			visual=dict(x="x", y="y", selection="fade", subspace="facet1", what="facet2",)
 		def _selection_name(name):
@@ -2657,7 +2498,6 @@ class Dataset(object):
 				else:
 					what_index = 0
 
-
 				if visual[normalize_axis] == "column":
 					normalize_index = j
 				elif visual[normalize_axis] == "row":
@@ -2668,8 +2508,7 @@ class Dataset(object):
 					r = _parse_reduction(r, colormaps[what_index], [])
 					rgrid = r(rgrid)
 
-				finite_mask = np.isfinite(ngrid[i,j])
-				rgrid[~finite_mask,3] = 0
+
 				row = facet_index // facet_columns
 				column = facet_index % facet_columns
 
@@ -2885,22 +2724,6 @@ class Dataset(object):
 		#xmin, xmax = limits[0]
 		#return pylab.plot(np.arange(N) / (N-1.0) * (xmax-xmin) + xmin, f(grid,), drawstyle="steps", **kwargs)
 		#pylab.ylim(-1, 6)
-
-	@property
-	def stat(self):
-		class StatList(object):
-			pass
-		statslist = StatList()
-		for name in self.get_column_names(virtual=True):
-			class Stats(object):
-				pass
-			stats = Stats()
-			for f in _functions_statistics_1d:
-				fname = f.__name__
-				p = property(lambda self, name=name, f=f, ds=self: f(ds, name))
-				setattr(Stats, fname, p)
-			setattr(statslist, name, stats)
-		return statslist
 
 	@property
 	def col(self):
@@ -3371,6 +3194,27 @@ class Dataset(object):
 			self.column_names.append(name)
 		else:
 			raise ValueError("functions not yet implemented")
+
+	def add_column_healpix(self, name="healpix", longitude="ra", latitude="dec", degrees=True, healpix_order=12, nest=True):
+		"""Add a healpix (in memory) column based on a longitude and latitude
+
+		:param name: Name of column
+		:param longitude: longitude expression
+		:param latitude: latitude expression  (astronomical convenction latitude=90 is north pole)
+		:param degrees: If lon/lat are in degrees (default) or radians.
+		:param healpix_order: healpix order, >= 0
+		:param nest: Nested healpix (default) or ring.
+		"""
+		import healpy as hp
+		if degrees:
+			scale = "*pi/180"
+		else:
+			scale = ""
+		# TODO: multithread this
+		phi = self.evaluate("(%s)%s" % (longitude, scale))
+		theta = self.evaluate("pi/2-(%s)%s" % (latitude, scale))
+		hp_index = hp.ang2pix(hp.order2nside(healpix_order), theta, phi, nest=nest)
+		self.add_column("healpix", hp_index)
 
 	def add_virtual_column_bearing(self, name, lon1, lat1, lon2, lat2):
 		lon1 = "(pickup_longitude * pi / 180)"
@@ -4032,7 +3876,7 @@ class Dataset(object):
 					else:
 						self.add_virtual_column(names[i]+uncertainty_postfix, "sqrt(%s)" % sigma)
 
-	def add_virtual_columns_cartesian_to_spherical(self, x, y, z, alpha, delta, distance, radians=True, center=None, center_name="solar_position"):
+	def add_virtual_columns_cartesian_to_spherical(self, x="x", y="y", z="z", alpha="l", delta="b", distance="distance", radians=False, center=None, center_name="solar_position"):
 		"""Convert cartesian to spherical coordinates.
 
 
@@ -4530,8 +4374,10 @@ class DatasetLocal(Dataset):
 		assert len(self) == len(other), "does not make sense to horizontally stack datasets with different lengths"
 		for name in other.get_column_names():
 			if prefix:
-				name = prefix + name
-			self.add_column(name, other.columns[name])
+				new_name = prefix + name
+			else:
+				new_name = name
+			self.add_column(new_name, other.columns[name])
 
 
 	def concat(self, other):
@@ -4558,13 +4404,12 @@ class DatasetLocal(Dataset):
 		"""The local implementation of :func:`Dataset.evaluate`"""
 		i1 = i1 or 0
 		i2 = i2 or len(self)
-		scope = _BlockScope(self, i1, i2, **self.variables)
+		mask = self.evaluate_selection_mask(selection, i1, i2) if selection is not None else None
+		scope = _BlockScope(self, i1, i2, mask=mask, **self.variables)
+		#	value = value[mask]
 		if out is not None:
 			scope.buffers[expression] = out
 		value = scope.evaluate(expression)
-		if selection is not None:
-			mask = self.evaluate_selection_mask(selection, i1, i2)
-			value = value[mask]
 		return value
 
 	def export_hdf5(self, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=False):
@@ -4748,134 +4593,3 @@ class DatasetArrays(DatasetLocal):
 			assert self.full_length() == len(data), "columns should be of equal length, length should be %d, while it is %d" % ( self.full_length(), len(data))
 		self._length = int(round(self.full_length() * self._active_fraction))
 		#self.set_active_fraction(self._active_fraction)
-
-
-
-
-
-
-#from vaex.remote import ServerRest, SubspaceRemote, DatasetRemote
-#from vaex.events import Signal
-
-if __name__ == "__main__":
-	import argparse
-	parser = argparse.ArgumentParser(prog='python -m vaex.dataset')
-	subparsers = parser.add_subparsers(help='sub-command help', dest="task")
-	parser_soneira = subparsers.add_parser('soneira', help='create soneira peebles dataset')
-	parser_soneira.add_argument('output', help='output file')
-	parser.add_argument("columns", help="list of columns to export", nargs="*")
-	parser_soneira.add_argument('--dimension','-d', type=int, help='dimensions', default=4)
-	#parser_soneira.add_argument('--eta','-e', type=int, help='dimensions', default=3)
-	parser_soneira.add_argument('--max-level','-m', type=int, help='dimensions', default=28)
-	parser_soneira.add_argument('--lambdas','-l', type=int, help='lambda values for fractal', default=[1.1, 1.3, 1.6, 2.])
-	args = parser.parse_args()
-	print(args.task)
-	if args.task == "soneira":
-		if vaex.utils.check_memory_usage(4*8*2**args.max_level, vaex.utils.confirm_on_console):
-			dataset = SoneiraPeebles(args.dimension, 2, args.max_level, args.lambdas)
-
-	if args.columns:
-		columns = args.columns
-	else:
-		columns = None
-	if columns is None:
-		columns = dataset.get_column_names()
-	for column in columns:
-		if column not in dataset.get_column_names():
-			print("column %r does not exist, run with --list or -l to list all columns")
-			sys.exit(1)
-
-	base, output_ext = os.path.splitext(args.output)
-	with vaex.utils.progressbar("exporting") as progressbar:
-		def update(p):
-			progressbar.update(p)
-			return True
-		if output_ext == ".hdf5":
-			dataset.export_hdf5(args.output, column_names=columns, progress=update)
-		else:
-			print("extension %s not supported, only .fits and .hdf5 are" % output_ext)
-
-	#vaex.set_log_level_debug()
-	#ds = DatasetTap()
-	#ds.columns["alpha"][0:100]
-
-
-def alias_main(argv):
-	import argparse
-	parser = argparse.ArgumentParser(argv[0])
-	#parser.add_argument('--verbose', '-v', action='count', default=0)
-	#parser.add_argument('--quiet', '-q', default=False, action='store_true', help="do not output anything")
-	#parser.add_argument('--list', '-l', default=False, action='store_true', help="list columns of input")
-	#parser.add_argument('--progress', help="show progress (default: %(default)s)", default=True, action='store_true')
-	#parser.add_argument('--no-progress', dest="progress", action='store_false')
-	#parser.add_argument('--shuffle', "-s", dest="shuffle", action='store_true', default=False)
-
-	subparsers = parser.add_subparsers(help='type of task', dest="task")
-
-	parser_list = subparsers.add_parser('list', help='list aliases')
-
-	parser_add = subparsers.add_parser('add', help='add alias')
-	parser_add.add_argument('name', help='name of alias')
-	parser_add.add_argument('path', help='path/filename for alias')
-	parser.add_argument('-f', '--force', help="force/overwrite existing alias", default=False, action='store_true')
-
-	parser_remove = subparsers.add_parser('remove', help='remove alias')
-	parser_remove.add_argument('name', help='name of alias')
-
-	args = parser.parse_args(argv[1:])
-	import vaex
-	if args.task == "add":
-		vaex.aliases[args.name] = args.path
-	if args.task == "remove":
-		del vaex.aliases[args.name]
-	if args.task == "list":
-		for name in sorted(vaex.aliases.keys()):
-			print("%s: %s" % (name, vaex.aliases[name]))
-
-
-def make_stat_parser(name):
-	import argparse
-	parser = argparse.ArgumentParser(name)
-	#parser.add_argument('--verbose', '-v', action='count', default=0)
-	#parser.add_argument('--quiet', '-q', default=False, action='store_true', help="do not output anything")
-	#parser.add_argument('--list', '-l', default=False, action='store_true', help="list columns of input")
-	#parser.add_argument('--progress', help="show progress (default: %(default)s)", default=True, action='store_true')
-	#parser.add_argument('--no-progress', dest="progress", action='store_false')
-	#parser.add_argument('--shuffle', "-s", dest="shuffle", action='store_true', default=False)
-
-	#subparsers = parser.add_subparsers(help='type of task', dest="task")
-
-	#parser_list = subparsers.add_parser('list', help='list aliases')
-
-	#parser = subparsers.add_parser('add', help='add alias')
-	parser.add_argument('dataset', help='path or name of dataset')
-	parser.add_argument('--fraction', "-f", dest="fraction", type=float, default=1.0, help="fraction of input dataset to export")
-	return parser
-
-def stat_main(argv):
-	parser = make_stat_parser(argv[0])
-	args = parser.parse_args(argv[1:])
-	import vaex
-	dataset = vaex.open(args.dataset)
-	if dataset is None:
-		print("Cannot open input: %s" % args.dataset)
-		sys.exit(1)
-	print("dataset:")
-	print("  length: %s" % len(dataset))
-	print("  full_length: %s" % dataset.full_length())
-	print("  name: %s" % dataset.name)
-	print("  path: %s" % dataset.path)
-	print("  columns: ")
-	desc = dataset.description
-	if desc:
-		print("    description: %s" % desc)
-	for name in dataset.get_column_names():
-		print("   - %s: " % name)
-		desc = dataset.descriptions.get(name)
-		if desc:
-			print("  \tdescription: %s" % desc)
-		unit = dataset.unit(name)
-		if unit:
-			print("   \tunit: %s" % unit)
-		dtype = dataset.dtype(name)
-		print("   \ttype: %s" % dtype.name)
