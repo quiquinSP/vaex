@@ -321,7 +321,7 @@ def confirm_on_console(topic, msg):
 	done = False
 	print(topic)
 	while not done:
-		output = raw_input(msg +":[y/n]")
+		output = input(msg +":[y/n]")
 		if output.lower() == "y":
 			return True
 		if output.lower() == "n":

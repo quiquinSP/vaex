@@ -47,6 +47,9 @@ default_shape = 128
 #executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 #executor = vaex.execution.default_executor
 
+def print_message(message):
+	print("Something is wrong")
+
 def _parse_f(f):
 	if f is None:
 		return lambda x: x
@@ -2182,6 +2185,20 @@ class Dataset(object):
 			return total_grid[slice(None, None, None) if waslist_what else 0, slice(None, None, None) if waslist_selection else 0]
 		s = finish(grids)
 		return self._async(async, s)
+
+	def as_nparray(self, x, selection=None) :
+		"""Convenience wrapper around pylab.scatter when for working with small datasets or selections
+
+		:param x: Expression for x axis
+		:param selection: Single selection expression, or None
+		:return:
+		"""
+		count = self.count(selection=selection)
+		# Check the memory usage
+		vaex.utils.check_memory_usage(count,vaex.utils.confirm_on_console)
+
+		return self.evaluate(x, selection=selection)
+
 
 	def scatter(self, x, y, s_expr=None, c_expr=None, selection=None, length_limit=50000, length_check=True, **kwargs):
 		"""Convenience wrapper around pylab.scatter when for working with small datasets or selections
